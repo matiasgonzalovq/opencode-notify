@@ -44,37 +44,43 @@ jobs:
 
       # Belt-and-braces: the repo must never carry a home directory, a private
       # hostname, or anything shaped like a credential.
+      #
+      # This workflow file is excluded because it necessarily contains the
+      # literal detector patterns below and would otherwise flag itself.
       - name: Scan working tree and full history
+        env:
+          HOME_RE: (/Users|/home)/[a-z]+
+          HOST_RE: ts\.net|tailnet
+          CRED_RE: (ghp_|github_pat_|sk-[A-Za-z0-9]{20,}|BEGIN (RSA|OPENSSH|EC|PGP) PRIVATE KEY)
+          ASSIGN_RE: (password|secret|token|api[_-]?key)[[:space:]]*[:=][[:space:]]*["'][^"']{8,}
         run: |
           set -euo pipefail
+          SELF=".github/workflows/ci.yml"
           fail=0
 
           scan() {
-            label="$1"; shift
-            if git grep -nI -E "$@" -- . ; then
-              echo "::error::Pattern matched in ${label}"
+            label="$1" pattern="$2"
+            if git grep -nI -E "$pattern" -- . ":(exclude)$SELF"; then
+              echo "::error::${label} matched in working tree"
               fail=1
             fi
           }
 
-          # Absolute home paths baked into source.
-          scan "home paths" '(/Users|/home)/[a-z]+'
-          # Private hostnames / tailnets.
-          scan "private hosts" 'ts\.net|tailnet'
-          # Credential shapes.
-          scan "credentials" '(ghp_|github_pat_|sk-[A-Za-z0-9]{20,}|BEGIN (RSA|OPENSSH|EC|PGP) PRIVATE KEY)'
-          scan "assigned secrets" '(password|secret|token|api[_-]?key)[[:space:]]*[:=][[:space:]]*["'"'"'][^"'"'"'${}{]{8,}'
+          scan "home paths"        "$HOME_RE"
+          scan "private hosts"     "$HOST_RE"
+          scan "credential shape"  "$CRED_RE"
+          scan "assigned secret"   "$ASSIGN_RE"
 
-          # Same patterns across every commit reachable from HEAD.
+          # High-signal patterns across every commit reachable from HEAD.
           for rev in $(git rev-list --all); do
-            if git grep -nI -E 'ts\.net|tailnet|(/Users|/home)/[a-z]+' "$rev" -- . ; then
-              echo "::error::Pattern matched in commit ${rev}"
+            if git grep -nI -E "$HOST_RE|$HOME_RE" "$rev" -- . ":(exclude)$SELF"; then
+              echo "::error::private data matched in commit ${rev}"
               fail=1
             fi
           done
 
-          if [ "${fail}" -ne 0 ]; then
+          if [ "$fail" -ne 0 ]; then
             echo "::error::Secret or private-data scan failed"
             exit 1
           fi
-          echo "Clean: no secrets or private paths found in tree or history."
+          echo "Clean: no secrets or private paths in tree or history."
