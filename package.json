@@ -1,0 +1,36 @@
+{
+  "name": "opencode-notify",
+  "version": "0.1.0",
+  "description": "ntfy.sh + macOS notifications for OpenCode: task completion, permission requests, questions and session errors.",
+  "type": "module",
+  "main": "plugins/ntfy-notifications.js",
+  "exports": {
+    ".": "./plugins/ntfy-notifications.js"
+  },
+  "files": [
+    "plugins/ntfy-notifications.js",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test tests/ntfy-notifications.test.js",
+    "test:vitest": "vitest run",
+    "test:all": "npm run test && npm run test:vitest"
+  },
+  "keywords": [
+    "opencode",
+    "plugin",
+    "notifications",
+    "ntfy",
+    "ntfysh",
+    "macos",
+    "terminal-notifier"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "vitest": "^3.2.4"
+  }
+}

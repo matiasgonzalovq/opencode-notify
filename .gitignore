@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Test / tooling output
+coverage/
+.vitest/
+*.tsbuildinfo
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment — never commit real topics, URLs or passwords
+.env
+.env.*
+!.env.example
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Local state: claim records are runtime state, never source
+ntfy-seen/
+state/

@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: [20, 22, 24]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: node:test suite
+        run: npm test
+
+      - name: vitest suite
+        run: npm run test:vitest
+
+  no-secrets:
+    name: no secrets committed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Belt-and-braces: the repo must never carry a home directory, a private
+      # hostname, or anything shaped like a credential.
+      - name: Scan working tree and full history
+        run: |
+          set -euo pipefail
+          fail=0
+
+          scan() {
+            label="$1"; shift
+            if git grep -nI -E "$@" -- . ; then
+              echo "::error::Pattern matched in ${label}"
+              fail=1
+            fi
+          }
+
+          # Absolute home paths baked into source.
+          scan "home paths" '(/Users|/home)/[a-z]+'
+          # Private hostnames / tailnets.
+          scan "private hosts" 'ts\.net|tailnet'
+          # Credential shapes.
+          scan "credentials" '(ghp_|github_pat_|sk-[A-Za-z0-9]{20,}|BEGIN (RSA|OPENSSH|EC|PGP) PRIVATE KEY)'
+          scan "assigned secrets" '(password|secret|token|api[_-]?key)[[:space:]]*[:=][[:space:]]*["'"'"'][^"'"'"'${}{]{8,}'
+
+          # Same patterns across every commit reachable from HEAD.
+          for rev in $(git rev-list --all); do
+            if git grep -nI -E 'ts\.net|tailnet|(/Users|/home)/[a-z]+' "$rev" -- . ; then
+              echo "::error::Pattern matched in commit ${rev}"
+              fail=1
+            fi
+          done
+
+          if [ "${fail}" -ne 0 ]; then
+            echo "::error::Secret or private-data scan failed"
+            exit 1
+          fi
+          echo "Clean: no secrets or private paths found in tree or history."
