@@ -29,6 +29,21 @@ Channels are independent. Set up one or both; a failure in one never affects the
 
 **No premature "done".** A completion is never reported while a permission, a question or an error is still pending for that run. Once you resolve it, completion reporting is re-enabled.
 
+### Event shapes
+
+Shapes were verified against the OpenCode **2.0.20** binary rather than assumed — the `@opencode-ai/sdk` package predates the `form.*` and `session.execution.*` events and does not describe them.
+
+| Event | Request id | Session id |
+| --- | --- | --- |
+| `permission.asked` | `data.id` | `data.sessionID` |
+| `permission.replied` | `data.requestID` | `data.sessionID` |
+| `form.created` | `data.form.id` | `data.form.sessionID` |
+| `form.replied` | `data.id` | `data.sessionID` |
+| `form.cancelled` | `data.id` | `data.sessionID` |
+| `session.execution.succeeded` | event `id` | `data.sessionID` |
+
+`form.created` is the one nested event; OpenCode resolves it with an explicit special case in its own source. The plugin matches that shape, so a pending form suppresses **its own** session's completion and does not leak into unrelated sessions.
+
 ---
 
 ## Install
@@ -81,6 +96,8 @@ OpenCode delivers one finished execution to **every** plugin instance. Without c
 The plugin claims each execution with an **atomic lockfile**: it creates a file named after the SHA-256 of the event id with `O_EXCL` (`wx`), which is atomic on POSIX. The first instance to create the file notifies; every other one gets `EEXIST` and stays silent. This needs no shared in-memory state, so it works across processes.
 
 Records live under `$OPENCODE_NTFY_STATE_DIR/ntfy-seen/` (`0700` dir, `0600` files) and are swept after 7 days. They contain only hashes — no topic, no message, no URL.
+
+Both `session.execution.succeeded` and `session.error` go through this claim, so a failure is also reported exactly once no matter how many plugin instances receive it.
 
 Events **without an id** can't be claimed by hash. Rather than dropping the notification, the plugin falls back to a short time bucket (2 s): bursts inside one run collapse into a single notification, and a later run notifies again. The worst case at a bucket boundary is a duplicate; never a missed notification.
 
@@ -209,6 +226,23 @@ export OPENCODE_NTFY_TOPIC="elige-una-cadena-larga-aleatoria"
 OpenCode entrega cada ejecución terminada a **todas** las instancias del plugin. Para no notificar una vez por instancia, cada ejecución se "reclama" con un **lockfile atómico**: se crea un archivo con el SHA-256 del id del evento usando `O_EXCL` (`wx`), atómico en POSIX. La instancia que lo crea primero notifica; las demás reciben `EEXIST` y guardan silencio. No hay estado en memoria compartido, así que funciona entre procesos.
 
 Los registros viven en `$OPENCODE_NTFY_STATE_DIR/ntfy-seen/` (dir `0700`, archivos `0600`) y se eliminan a los 7 días. Contienen solo hashes.
+
+Tanto `session.execution.succeeded` como `session.error` pasan por este mecanismo, así que un fallo también se reporta exactamente una vez sin importar cuántas instancias del plugin lo reciban.
+
+### Formas de los eventos
+
+Verificadas contra el binario de OpenCode **2.0.20**, no asumidas — el paquete `@opencode-ai/sdk` es anterior a los eventos `form.*` y `session.execution.*` y no los describe.
+
+| Evento | id de la petición | sessionID |
+| --- | --- | --- |
+| `permission.asked` | `data.id` | `data.sessionID` |
+| `permission.replied` | `data.requestID` | `data.sessionID` |
+| `form.created` | `data.form.id` | `data.form.sessionID` |
+| `form.replied` | `data.id` | `data.sessionID` |
+| `form.cancelled` | `data.id` | `data.sessionID` |
+| `session.execution.succeeded` | `id` del evento | `data.sessionID` |
+
+`form.created` es el único evento anidado. El plugin respeta esa forma, de modo que un formulario pendiente suprime la finalización **de su propia sesión** y no contamina a sesiones ajenas.
 
 Los eventos **sin id** no se pueden reclamar por hash. En vez de descartarlos, se usa una ventana de tiempo corta (2 s): las ráfagas de una misma ejecución colapsan en una sola notificación y una ejecución posterior vuelve a notificar. El peor caso en un límite de ventana es un duplicado; nunca una notificación perdida.
 

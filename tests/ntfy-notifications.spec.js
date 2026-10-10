@@ -41,15 +41,22 @@ function decodeHeader(value) {
 
 describe("ntfy-notifications", () => {
   let originalEnv
+  let scratchStateDir
 
   beforeEach(() => {
     originalEnv = { ...process.env }
     process.env.OPENCODE_NTFY_TOPIC = MOCK_TOPIC
     delete process.env.OPENCODE_REMOTE_URL
+    // Several events claim through the lockfile. Point the state directory at
+    // a scratch dir so the suite can never write into the live
+    // ~/.config/opencode/ntfy-seen and swallow a real notification.
+    scratchStateDir = fs.mkdtempSync(path.join(os.tmpdir(), "ntfy-state-"))
+    process.env.OPENCODE_NTFY_STATE_DIR = scratchStateDir
   })
 
   afterEach(() => {
     process.env = originalEnv
+    fs.rmSync(scratchStateDir, { recursive: true, force: true })
   })
 
   describe("OPENCODE_REMOTE_URL", () => {
@@ -1104,6 +1111,146 @@ describe("ntfy-notifications", () => {
         path.join("/custom/state", "ntfy-seen"),
       )
       expect(resolveClaimDir({}, "/synthetic-home/x")).toBe(path.join("/synthetic-home/x", ".config", "opencode", "ntfy-seen"))
+    })
+  })
+
+  // OpenCode 2.0.20 emits `form.created` NESTED (data.form.id, data.form.sessionID)
+  // while form.replied / form.cancelled carry them FLAT (data.id, data.sessionID).
+  // Verified against the shipped binary, which special-cases it:
+  //   if (e.type === "form.created") return e.data.form.sessionID
+  describe("v2 form contract (verified against the OpenCode 2.0.20 binary)", () => {
+    it("form.created (nested) suppresses its OWN session's completion", async () => {
+      const { fetchImpl, calls } = createMockFetch()
+      const handler = createNotificationHandler({ topic: MOCK_TOPIC, projectName: "test", fetchImpl })
+
+      await handler({ event: { type: "session.status", data: { sessionID: "ses_D", status: { type: "busy" } } } })
+      await handler({
+        event: { type: "form.created", id: "e3", data: { form: { id: "f3", sessionID: "ses_D" } } },
+      })
+
+      expect(calls).toHaveLength(1)
+      expect(calls[0].options.headers.Priority).toBe("high")
+
+      await handler({ event: { type: "session.status", data: { sessionID: "ses_D", status: { type: "idle" } } } })
+      expect(calls).toHaveLength(1)
+    })
+
+    it("form.replied (flat) clears the pending state created by nested form.created", async () => {
+      const { fetchImpl, calls } = createMockFetch()
+      const handler = createNotificationHandler({ topic: MOCK_TOPIC, projectName: "test", fetchImpl })
+
+      await handler({ event: { type: "session.status", data: { sessionID: "ses_E", status: { type: "busy" } } } })
+      await handler({
+        event: { type: "form.created", id: "e4", data: { form: { id: "f4", sessionID: "ses_E" } } },
+      })
+      await handler({ event: { type: "form.replied", data: { sessionID: "ses_E", id: "f4" } } })
+      await handler({ event: { type: "session.status", data: { sessionID: "ses_E", status: { type: "busy" } } } })
+      await handler({ event: { type: "session.idle", data: { sessionID: "ses_E" } } })
+
+      expect(calls).toHaveLength(2)
+    })
+
+    it("form.cancelled (flat) clears the pending state created by nested form.created", async () => {
+      const { fetchImpl, calls } = createMockFetch()
+      const handler = createNotificationHandler({ topic: MOCK_TOPIC, projectName: "test", fetchImpl })
+
+      await handler({ event: { type: "session.status", data: { sessionID: "ses_F", status: { type: "busy" } } } })
+      await handler({
+        event: { type: "form.created", id: "e5", data: { form: { id: "f5", sessionID: "ses_F" } } },
+      })
+      await handler({ event: { type: "form.cancelled", data: { sessionID: "ses_F", id: "f5" } } })
+      await handler({ event: { type: "session.status", data: { sessionID: "ses_F", status: { type: "busy" } } } })
+      await handler({ event: { type: "session.idle", data: { sessionID: "ses_F" } } })
+
+      expect(calls).toHaveLength(2)
+    })
+
+    it("a pending form must not block an UNRELATED session's completion", async () => {
+      const { fetchImpl, calls } = createMockFetch()
+      const handler = createNotificationHandler({ topic: MOCK_TOPIC, projectName: "test", fetchImpl })
+
+      await handler({ event: { type: "session.status", data: { sessionID: "ses_A", status: { type: "busy" } } } })
+      await handler({
+        event: { type: "form.created", id: "e1", data: { form: { id: "f1", sessionID: "ses_A" } } },
+      })
+      await handler({ event: { type: "session.status", data: { sessionID: "ses_B", status: { type: "busy" } } } })
+      await handler({ event: { type: "session.idle", data: { sessionID: "ses_B" } } })
+
+      expect(calls).toHaveLength(2)
+    })
+
+    it("a form without sessionID must not poison a real session", async () => {
+      const { fetchImpl, calls } = createMockFetch()
+      const handler = createNotificationHandler({ topic: MOCK_TOPIC, projectName: "test", fetchImpl })
+
+      await handler({
+        event: { type: "form.created", id: "e2", data: { form: { id: "f2", sessionID: undefined } } },
+      })
+      await handler({ event: { type: "session.status", data: { sessionID: "ses_C", status: { type: "busy" } } } })
+      await handler({ event: { type: "session.idle", data: { sessionID: "ses_C" } } })
+
+      expect(calls).toHaveLength(2)
+    })
+  })
+
+  describe("session.error cross-instance deduplication", () => {
+    const withClaimDir = (extra = {}) => {
+      const { fetchImpl, calls } = createMockFetch()
+      return {
+        calls,
+        handler: createNotificationHandler({
+          topic: MOCK_TOPIC,
+          projectName: "test",
+          fetchImpl,
+          claimDir: fs.mkdtempSync(path.join(os.tmpdir(), "ntfy-claim-")),
+          ...extra,
+        }),
+      }
+    }
+
+    it("notifies once across instances when the error carries an id", async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ntfy-claim-"))
+      const mk = () => {
+        const { fetchImpl, calls } = createMockFetch()
+        return {
+          calls,
+          handler: createNotificationHandler({ topic: MOCK_TOPIC, projectName: "test", fetchImpl, claimDir: dir }),
+        }
+      }
+      const a = mk()
+      const b = mk()
+      const err = { type: "session.error", id: "err-1", data: { sessionID: "s1" } }
+      await a.handler({ event: err })
+      await b.handler({ event: err })
+      expect(a.calls.length + b.calls.length).toBe(1)
+    })
+
+    it("notifies once across instances when the error has NO id", async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ntfy-claim-"))
+      const mk = () => {
+        const { fetchImpl, calls } = createMockFetch()
+        return {
+          calls,
+          handler: createNotificationHandler({
+            topic: MOCK_TOPIC, projectName: "test", fetchImpl, claimDir: dir, now: () => 1_000_000,
+          }),
+        }
+      }
+      const a = mk()
+      const b = mk()
+      const err = { type: "session.error", data: { sessionID: "s1" } }
+      await a.handler({ event: err })
+      await b.handler({ event: err })
+      expect(a.calls.length + b.calls.length).toBe(1)
+    })
+
+    it("a later distinct error still notifies after the claim", async () => {
+      let clock = 1_000_000
+      const { calls, handler } = withClaimDir({ now: () => clock })
+      await handler({ event: { type: "session.error", data: { sessionID: "s1" } } })
+      clock += 31_000
+      await handler({ event: { type: "session.error", data: { sessionID: "s1" } } })
+      expect(calls).toHaveLength(2)
     })
   })
 })

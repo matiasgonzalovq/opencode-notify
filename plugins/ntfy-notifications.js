@@ -143,13 +143,25 @@ function payloadOf(event) {
   return event?.properties ?? event?.data ?? event ?? {}
 }
 
+// `form.created` is the one event that nests its payload: OpenCode ships
+// `data.form.sessionID` and `data.form.id`, while the reply/cancel events
+// carry them flat as `data.sessionID` and `data.id`. Read the official
+// extractor shape, otherwise every form lands in the "unknown" bucket and
+// leaks its pending state into unrelated sessions.
 function sessionID(event) {
-  return payloadOf(event)?.sessionID || "unknown"
+  const payload = payloadOf(event)
+  return payload?.sessionID || payload?.form?.sessionID || "unknown"
 }
 
 function requestID(event) {
   const payload = payloadOf(event)
-  return payload?.id || payload?.requestID || payload?.permissionID || event?.id
+  return (
+    payload?.form?.id ||
+    payload?.id ||
+    payload?.requestID ||
+    payload?.permissionID ||
+    event?.id
+  )
 }
 
 function getRemoteUrl() {
@@ -426,6 +438,10 @@ export function createNotificationHandler({
             ? `error:${id}:${rawId}`
             : bucketedKey("error", id, NO_ID_ERROR_BUCKET_MS, now)
           if (!remember(key)) return
+          // `remember()` is per-instance, so a shared claim is still required:
+          // the same failure reaches every plugin instance, and without this
+          // each of them would emit its own notification.
+          if (!claimEventOnce(key, claimDir)) return
           await send({
             title: "OpenCode — Error",
             message: projectName && projectName !== "OpenCode"

@@ -23,7 +23,10 @@ function harness(options = {}) {
     fetchImpl: options.fetchImpl ?? (async (url, init) => calls.push({ url, init })),
     timeoutMs: 20,
     execFileImpl: options.execFileImpl ?? (() => {}),
-    claimDir: options.claimDir,
+    // Default to a throwaway dir: several events now claim through the
+    // lockfile, and without this the suite would write into the real
+    // ~/.config/opencode/ntfy-seen and interfere with a live installation.
+    claimDir: options.claimDir ?? tmpClaimDir(),
     now: options.now,
   })
   return { calls, handler }
@@ -186,6 +189,86 @@ test("v2 form.created notifies and form.replied clears the pending state", async
   await handler({ event: { type: "session.status", data: { sessionID: "s1", status: { type: "busy" } } } })
   await handler({ event: { type: "session.idle", data: { sessionID: "s1" } } })
   assert.equal(calls.length, 2)
+})
+
+// --- OpenCode v2 form contract, as actually shipped ---
+//
+// OpenCode 2.0.20 emits `form.created` NESTED: `data.form.id` and
+// `data.form.sessionID`. The reply/cancel events carry them FLAT:
+// `data.id` and `data.sessionID`. Verified against the shipped binary,
+// which resolves the session with its own special case:
+//   if (e.type === "form.created") return e.data.form.sessionID
+// Reading `data.sessionID` directly put every form in the "unknown" bucket,
+// which both failed to suppress the owning session's completion and leaked
+// pending state into unrelated sessions.
+
+test("v2 form.created (nested shape) suppresses its OWN session's completion", async () => {
+  const { calls, handler } = harness()
+  await handler({ event: { type: "session.status", data: { sessionID: "ses_D", status: { type: "busy" } } } })
+  await handler({
+    event: { type: "form.created", id: "e3", data: { form: { id: "f3", sessionID: "ses_D" } } },
+  })
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].init.headers.Priority, "high")
+  assert.match(calls[0].init.body, /respuesta o selección/)
+
+  await handler({ event: { type: "session.status", data: { sessionID: "ses_D", status: { type: "idle" } } } })
+  assert.equal(calls.length, 1, "no premature completion while the form is pending")
+})
+
+test("v2 form.replied (flat shape) clears the nested form.created pending state", async () => {
+  const { calls, handler } = harness()
+  await handler({ event: { type: "session.status", data: { sessionID: "ses_E", status: { type: "busy" } } } })
+  await handler({
+    event: { type: "form.created", id: "e4", data: { form: { id: "f4", sessionID: "ses_E" } } },
+  })
+  await handler({ event: { type: "form.replied", data: { sessionID: "ses_E", id: "f4" } } })
+  await handler({ event: { type: "session.status", data: { sessionID: "ses_E", status: { type: "busy" } } } })
+  await handler({ event: { type: "session.idle", data: { sessionID: "ses_E" } } })
+  assert.equal(calls.length, 2, "ask, then completion once answered")
+})
+
+test("v2 form.cancelled (flat shape) clears the nested form.created pending state", async () => {
+  const { calls, handler } = harness()
+  await handler({ event: { type: "session.status", data: { sessionID: "ses_F", status: { type: "busy" } } } })
+  await handler({
+    event: { type: "form.created", id: "e5", data: { form: { id: "f5", sessionID: "ses_F" } } },
+  })
+  await handler({ event: { type: "form.cancelled", data: { sessionID: "ses_F", id: "f5" } } })
+  await handler({ event: { type: "session.status", data: { sessionID: "ses_F", status: { type: "busy" } } } })
+  await handler({ event: { type: "session.idle", data: { sessionID: "ses_F" } } })
+  assert.equal(calls.length, 2)
+})
+
+test("regression: a pending form must not block an UNRELATED session's completion", async () => {
+  const { calls, handler } = harness()
+  await handler({ event: { type: "session.status", data: { sessionID: "ses_A", status: { type: "busy" } } } })
+  await handler({
+    event: { type: "form.created", id: "e1", data: { form: { id: "f1", sessionID: "ses_A" } } },
+  })
+  // ses_B is unrelated and healthy; it must still get its completion.
+  await handler({ event: { type: "session.status", data: { sessionID: "ses_B", status: { type: "busy" } } } })
+  await handler({ event: { type: "session.idle", data: { sessionID: "ses_B" } } })
+  assert.equal(calls.length, 2)
+})
+
+test("regression: a form without sessionID must not poison a real session", async () => {
+  const { calls, handler } = harness()
+  await handler({
+    event: { type: "form.created", id: "e2", data: { form: { id: "f2", sessionID: undefined } } },
+  })
+  await handler({ event: { type: "session.status", data: { sessionID: "ses_C", status: { type: "busy" } } } })
+  await handler({ event: { type: "session.idle", data: { sessionID: "ses_C" } } })
+  assert.equal(calls.length, 2)
+})
+
+test("v2 permission.asked/replied still match under the verified shapes", async () => {
+  const { calls, handler } = harness()
+  await handler({ event: { type: "permission.asked", id: "pe1", data: { id: "p1", sessionID: "s1" } } })
+  await handler({ event: { type: "permission.replied", id: "pe2", data: { sessionID: "s1", requestID: "p1" } } })
+  await handler({ event: { type: "session.status", data: { sessionID: "s1", status: { type: "busy" } } } })
+  await handler({ event: { type: "session.idle", data: { sessionID: "s1" } } })
+  assert.equal(calls.length, 2, "permission ask, then completion")
 })
 
 // --- OpenCode v2 execution completion (atomic lockfile claim) ---
@@ -372,7 +455,84 @@ test("regression: errors from different sessions are independent", async () => {
   assert.equal(calls.length, 2)
 })
 
-// --- regression: portable state dir ---
+// --- regression: session.error must deduplicate across instances ---
+//
+// Errors previously relied on `remember()`, which is per-instance in-memory
+// state. Every plugin instance therefore emitted its own notification for the
+// same failure, whether or not the event carried an id.
+
+test("regression: session.error with an id notifies once across instances", async () => {
+  const dir = tmpClaimDir()
+  const a = harness({ claimDir: dir })
+  const b = harness({ claimDir: dir })
+  const err = { type: "session.error", id: "err-1", data: { sessionID: "s1" } }
+  await a.handler({ event: err })
+  await b.handler({ event: err })
+  assert.equal(a.calls.length + b.calls.length, 1)
+})
+
+test("regression: session.error WITHOUT an id notifies once across instances", async () => {
+  const dir = tmpClaimDir()
+  const a = harness({ claimDir: dir, now: () => 1_000_000 })
+  const b = harness({ claimDir: dir, now: () => 1_000_000 })
+  const err = { type: "session.error", data: { sessionID: "s1" } }
+  await a.handler({ event: err })
+  await b.handler({ event: err })
+  assert.equal(a.calls.length + b.calls.length, 1)
+})
+
+test("regression: 20 simultaneous instances agree on one session.error", async () => {
+  const dir = tmpClaimDir()
+  const hs = Array.from({ length: 20 }, () => harness({ claimDir: dir, now: () => 1_000_000 }))
+  const err = { type: "session.error", data: { sessionID: "s1" } }
+  await Promise.all(hs.map((h) => h.handler({ event: err })))
+  const total = hs.reduce((n, h) => n + h.calls.length, 0)
+  assert.equal(total, 1)
+})
+
+test("regression: a later distinct error still notifies after the claim", async () => {
+  let clock = 1_000_000
+  const { calls, handler } = harness({ claimDir: tmpClaimDir(), now: () => clock })
+  await handler({ event: { type: "session.error", data: { sessionID: "s1" } } })
+  clock += 31_000
+  await handler({ event: { type: "session.error", data: { sessionID: "s1" } } })
+  assert.equal(calls.length, 2, "the claim must not permanently silence later errors")
+})
+
+test("regression: errors from different sessions claim independently", async () => {
+  const dir = tmpClaimDir()
+  const { calls, handler } = harness({ claimDir: dir, now: () => 1_000_000 })
+  await handler({ event: { type: "session.error", data: { sessionID: "s1" } } })
+  await handler({ event: { type: "session.error", data: { sessionID: "s2" } } })
+  assert.equal(calls.length, 2)
+})
+
+test("regression: the suite never writes into the real claim directory", async () => {
+  // Several events claim through the lockfile now. If a harness ever omits
+  // `claimDir`, the suite would silently write into the live
+  // ~/.config/opencode/ntfy-seen and could swallow a real user's notification.
+  const realDir = resolveClaimDir()
+  const realBefore = fs.existsSync(realDir) ? fs.readdirSync(realDir).sort() : null
+
+  // Both instances must share one claim directory, exactly as multiple
+  // plugin instances do on a real host.
+  const shared = tmpClaimDir()
+  const a = harness({ claimDir: shared })
+  const b = harness({ claimDir: shared })
+  const done = v2event("session.execution.succeeded", { sessionID: "s1" }, "guard-id")
+  await a.handler({ event: done })
+  await b.handler({ event: done })
+  assert.equal(a.calls.length + b.calls.length, 1)
+
+  // The harness must have claimed somewhere other than the live directory.
+  const claimed = fs.readdirSync(os.tmpdir()).filter((f) => f.startsWith("ntfy-claim-"))
+  assert.ok(claimed.length > 0, "harness should claim into a temp dir")
+
+  if (realBefore !== null) {
+    const realAfter = fs.readdirSync(realDir).sort()
+    assert.deepEqual(realAfter, realBefore, "real claim directory must be untouched")
+  }
+})
 
 test("resolveClaimDir honours OPENCODE_NTFY_STATE_DIR", () => {
   assert.equal(

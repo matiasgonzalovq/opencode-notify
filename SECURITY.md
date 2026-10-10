@@ -28,9 +28,11 @@ It does **not** read `OPENCODE_SERVER_PASSWORD`, and that value is never placed 
 Claim records are stored under `$OPENCODE_NTFY_STATE_DIR/ntfy-seen/`:
 
 - Directory mode `0700`, file mode `0600`.
-- Filenames are `SHA-256(event id)` — the id is not recoverable from the filename in practice, and contains no topic, message or URL.
+- Filenames are `SHA-256(dedup key)`. The key is derived from the event id, the session id and the event type — never from the topic, a message body or a URL.
 - Files are empty; they record only that an event was delivered.
 - Records are swept after 7 days.
+
+Both `session.execution.succeeded` and `session.error` claim through this mechanism, so a run is reported exactly once regardless of how many plugin instances receive the event.
 
 Because the state directory may be shared with the pre-0.1.0 plugin, the default location is unchanged so an upgrade does not re-notify already-seen runs.
 
