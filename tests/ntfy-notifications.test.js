@@ -154,6 +154,9 @@ test("macOS channel invokes terminal-notifier with title/message/sound", async (
     fetchImpl: async () => {},
     execFileImpl: (binary, args) => execs.push({ binary, args }),
     notifierPath: "/opt/homebrew/bin/terminal-notifier",
+    // Pin the platform: without it the handler inherits process.platform and
+    // the macOS channel stays disabled on a Linux CI runner.
+    platform: "darwin",
   })
   await handler({ event: event("session.status", { sessionID: "s1", status: { type: "busy" } }) })
   await handler({ event: event("session.idle", { sessionID: "s1" }) })

@@ -789,6 +789,9 @@ describe("ntfy-notifications", () => {
         fetchImpl,
         execFileImpl,
         notifierPath: "/fake/terminal-notifier",
+        // Pin it: otherwise the handler inherits process.platform and the
+        // macOS channel stays disabled on a Linux CI runner.
+        platform: "darwin",
       })
 
       await handler({ event: createEvent("session.status", { sessionID: "s1", status: { type: "busy" } }) })
@@ -813,6 +816,7 @@ describe("ntfy-notifications", () => {
         fetchImpl,
         execFileImpl,
         notifierPath: "/fake/terminal-notifier",
+        platform: "darwin",
       })
 
       await handler({ event: createEvent("session.status", { sessionID: "s1", status: { type: "busy" } }) })
@@ -831,6 +835,7 @@ describe("ntfy-notifications", () => {
         fetchImpl,
         execFileImpl,
         notifierPath: "/fake/terminal-notifier",
+        platform: "darwin",
       })
 
       await handler({ event: createEvent("session.status", { sessionID: "s1", status: { type: "busy" } }) })
@@ -869,6 +874,7 @@ describe("ntfy-notifications", () => {
         fetchImpl,
         execFileImpl,
         notifierPath: "/opt/homebrew/bin/terminal-notifier",
+        platform: "darwin",
       })
 
       await handler({ event: createEvent("permission.asked", { sessionID: "s1", id: "r1" }) })
